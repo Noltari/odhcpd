@@ -136,7 +136,6 @@ struct odhcpd_ipaddr {
 		/* ipv6 only */
 		struct {
 			uint8_t dprefix;
-			uint8_t invalid_advertisements;
 			bool tentative;
 		};
 

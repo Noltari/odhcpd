@@ -543,9 +543,21 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 
 			memcpy(&addrs[valid_addr_cnt], iface->invalid_addr6, sizeof(*addrs) * invalid_addr_cnt);
 
-			/* Remove invalid prefixes that were advertised 3 times */
+			/* 
+			 * RFC9096 § 3.5
+			 *
+			 * - Any prefixes that were previously advertised by the CE router
+			 *   via PIOs in RA messages, but that have now become stale, MUST
+			 *   be advertised with PIOs that have the "Valid Lifetime" and the
+			 *   "Preferred Lifetime" set to 0 and the "A" and "L" bits
+			 *   unchanged.
+			 *
+			 * - The aforementioned advertisements MUST be performed for at
+			 *   least the "Valid Lifetime" previously employed for such
+			 *   prefixes.
+			 */
 			while (i < iface->invalid_addr6_len) {
-				if (++iface->invalid_addr6[i].invalid_advertisements >= 3) {
+				if (now > iface->invalid_addr6[i].valid_lt) {
 					if (i + 1 < iface->invalid_addr6_len)
 						memmove(&iface->invalid_addr6[i], &iface->invalid_addr6[i + 1], sizeof(*addrs) * (iface->invalid_addr6_len - i - 1));
 
@@ -651,8 +663,25 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 			p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_AUTO;
 		if (iface->ra_advrouter)
 			p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_RADDR;
-		p->nd_opt_pi_preferred_time = htonl(preferred_lt);
-		p->nd_opt_pi_valid_time = htonl(valid_lt);
+		if (i >= valid_addr_cnt || !preferred_lt)
+		{
+			/* 
+			 * RFC9096 § 3.5
+			 *
+			 * - Any prefixes that were previously advertised by the CE router
+			 *   via PIOs in RA messages, but that have now become stale, MUST
+			 *   be advertised with PIOs that have the "Valid Lifetime" and the
+			 *   "Preferred Lifetime" set to 0 and the "A" and "L" bits
+			 *   unchanged.
+			 */
+			p->nd_opt_pi_preferred_time = 0;
+			p->nd_opt_pi_valid_time = 0;
+		}
+		else
+		{
+			p->nd_opt_pi_preferred_time = htonl(preferred_lt);
+			p->nd_opt_pi_valid_time = htonl(valid_lt);
+		}
 	}
 
 	iov[IOV_RA_PFXS].iov_base = (char *)pfxs;
