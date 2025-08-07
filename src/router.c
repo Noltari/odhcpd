@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <signal.h>
 #include <resolv.h>
 #include <stdio.h>
@@ -24,6 +25,8 @@
 #include <arpa/inet.h>
 #include <net/route.h>
 
+#include <json-c/json.h>
+#include <libubox/md5.h>
 #include <libubox/utils.h>
 
 #include "router.h"
@@ -38,12 +41,16 @@ static void handle_icmpv6(void *addr, void *data, size_t len,
 static void trigger_router_advert(struct uloop_timeout *event);
 static void router_netevent_cb(unsigned long event, struct netevent_handler_info *info);
 
+int router_write_pdfile(void);
+
 static struct netevent_handler router_netevent_handler = { .cb = router_netevent_cb, };
 
 static FILE *fp_route = NULL;
 
+static uint8_t pd_md5[16];
 
 #define TIME_LEFT(t1, now) ((t1) != UINT32_MAX ? (t1) - (now) : UINT32_MAX)
+
 
 int router_init(void)
 {
@@ -450,6 +457,102 @@ struct nd_opt_dnr_info {
 	uint8_t body[];
 };
 
+/* RFC9096 stale IPv6 SLAAC */
+
+static void router_clear_delegated_ipv6(time_t now,
+	struct interface *iface)
+{
+	char buf[INET6_ADDRSTRLEN];
+	size_t i;
+
+	/* Remove expired prefixes */
+	i = 0;
+	while (i < iface->del_pfx_cnt) {
+		struct del_ipv6 *cur_pfx = &iface->del_pfx[i];
+
+		if (now > cur_pfx->pfx_lt) {
+			syslog(LOG_WARNING, "[RFC9096] %s: rem %s/%u", iface->ifname, inet_ntop(AF_INET6, &cur_pfx->pfx, buf, sizeof(buf)), cur_pfx->pfx_len);
+
+			if (i + 1 < iface->del_pfx_cnt) {
+				memmove(&iface->del_pfx[i], &iface->del_pfx[i + 1], sizeof(struct del_ipv6) * (iface->del_pfx_cnt - i - 1));
+			}
+
+			iface->del_pfx_cnt--;
+
+			if (iface->del_pfx_cnt) {
+				struct del_ipv6 *new_del_pfx = realloc(iface->del_pfx, sizeof(struct del_ipv6) * iface->del_pfx_cnt);
+
+				if (new_del_pfx) {
+					iface->del_pfx = new_del_pfx;
+				}
+			} else {
+				free(iface->del_pfx);
+				iface->del_pfx = NULL;
+			}
+		} else {
+			i++;
+		}
+	}
+}
+
+static int router_store_delegated_ipv6(time_t now,
+	struct interface *iface,
+	struct nd_opt_prefix_info *p,
+	uint32_t valid_lt)
+{
+	struct del_ipv6 *del_pfx = NULL;
+	char buf[INET6_ADDRSTRLEN];
+	size_t i;
+
+	/* Skip infinite prefixes */
+	if (p->nd_opt_pi_valid_time == UINT32_MAX) {
+		syslog(LOG_DEBUG, "[RFC9096] %s: skip %s/%u", iface->ifname, inet_ntop(AF_INET6, &p->nd_opt_pi_prefix, buf, sizeof(buf)), p->nd_opt_pi_prefix_len);
+		return 0;
+	}
+
+	/* Find prefix */
+	for (i = 0; i < iface->del_pfx_cnt; i++) {
+		struct del_ipv6 *cur_pfx = &iface->del_pfx[i];
+
+		if (p->nd_opt_pi_prefix_len == cur_pfx->pfx_len &&
+			!odhcpd_bmemcmp(&p->nd_opt_pi_prefix, &cur_pfx->pfx, cur_pfx->pfx_len)) {
+			del_pfx = cur_pfx;
+		}
+	}
+
+	/* Add prefix */
+	if (!del_pfx) {
+		iface->del_pfx_cnt++;
+		iface->del_pfx = realloc(iface->del_pfx, sizeof(struct del_ipv6) * iface->del_pfx_cnt);
+		if (iface->del_pfx) {
+			del_pfx = &iface->del_pfx[iface->del_pfx_cnt - 1];
+			memcpy(&del_pfx->pfx, &p->nd_opt_pi_prefix, sizeof(del_pfx->pfx));
+			del_pfx->pfx_len = p->nd_opt_pi_prefix_len;
+			del_pfx->pfx_lt = valid_lt;
+			iface->del_pfx_upd = true;
+			syslog(LOG_WARNING, "[RFC9096] %s: add %s/%u", iface->ifname, inet_ntop(AF_INET6, &del_pfx->pfx, buf, sizeof(buf)), del_pfx->pfx_len);
+		}
+	}
+
+	if (!del_pfx) {
+		return -1;
+	}
+
+	/* Update prefix lifetime */
+	if (del_pfx->pfx_lt != valid_lt) {
+		syslog(LOG_WARNING, "[RFC9096] %s: renew %s/%u (%u -> %u)",
+			iface->ifname,
+			inet_ntop(AF_INET6, &del_pfx->pfx, buf, sizeof(buf)),
+			del_pfx->pfx_len,
+			TIME_LEFT(del_pfx->pfx_lt, now),
+			TIME_LEFT(valid_lt, now));
+		del_pfx->pfx_lt = valid_lt;
+		iface->del_pfx_upd = true;
+	}
+
+	return 0;
+}
+
 /* Router Advert server mode */
 static int send_router_advert(struct interface *iface, const struct in6_addr *from)
 {
@@ -467,7 +570,7 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 	struct sockaddr_in6 dest;
 	size_t dns_sz = 0, search_sz = 0, pref64_sz = 0, dnrs_sz = 0;
 	size_t pfxs_cnt = 0, routes_cnt = 0;
-	ssize_t valid_addr_cnt = 0, invalid_addr_cnt = 0;
+	size_t total_addr_cnt = 0, valid_addr_cnt = 0;
 	/* 
 	 * lowest_found_lifetime stores the lowest lifetime of all prefixes;
 	 * necessary to find shortest adv interval necessary
@@ -478,6 +581,8 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 	bool default_route = false;
 	bool valid_prefix = false;
 	char buf[INET6_ADDRSTRLEN];
+
+	router_clear_delegated_ipv6(now, iface);
 
 	memset(&adv, 0, sizeof(adv));
 	adv.h.nd_ra_type = ND_ROUTER_ADVERT;
@@ -517,7 +622,6 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 	iov[IOV_RA_ADV].iov_len = sizeof(adv);
 
 	valid_addr_cnt = (iface->timer_rs.cb /* if not shutdown */ ? iface->addr6_len : 0);
-	invalid_addr_cnt = iface->invalid_addr6_len;
 
 	// check ra_default
 	if (iface->default_router) {
@@ -527,47 +631,50 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 			valid_prefix = true;
 	}
 
-	if (valid_addr_cnt + invalid_addr_cnt) {
-		addrs = alloca(sizeof(*addrs) * (valid_addr_cnt + invalid_addr_cnt));
+	if (valid_addr_cnt + iface->del_pfx_cnt) {
+		addrs = alloca(sizeof(*addrs) * (valid_addr_cnt + iface->del_pfx_cnt));
 
 		if (valid_addr_cnt) {
 			memcpy(addrs, iface->addr6, sizeof(*addrs) * valid_addr_cnt);
+			total_addr_cnt = valid_addr_cnt;
 
 			/* Check default route */
 			if (!default_route && parse_routes(addrs, valid_addr_cnt))
 				default_route = true;
 		}
 
-		if (invalid_addr_cnt) {
-			size_t i = 0;
+		if (iface->del_pfx_cnt) {
+			size_t i, j;
 
-			memcpy(&addrs[valid_addr_cnt], iface->invalid_addr6, sizeof(*addrs) * invalid_addr_cnt);
+			for (i = 0; i < iface->del_pfx_cnt; i++) {
+				struct del_ipv6 *cur_pfx = &iface->del_pfx[i];
+				bool pfx_found = false;
 
-			/* Remove invalid prefixes that were advertised 3 times */
-			while (i < iface->invalid_addr6_len) {
-				if (++iface->invalid_addr6[i].invalid_advertisements >= 3) {
-					if (i + 1 < iface->invalid_addr6_len)
-						memmove(&iface->invalid_addr6[i], &iface->invalid_addr6[i + 1], sizeof(*addrs) * (iface->invalid_addr6_len - i - 1));
+				for (j = 0; j < valid_addr_cnt; j++) {
+					struct odhcpd_ipaddr *cur_addr = &addrs[j];
 
-					iface->invalid_addr6_len--;
-
-					if (iface->invalid_addr6_len) {
-						struct odhcpd_ipaddr *new_invalid_addr6 = realloc(iface->invalid_addr6, sizeof(*addrs) * iface->invalid_addr6_len);
-
-						if (new_invalid_addr6)
-							iface->invalid_addr6 = new_invalid_addr6;
-					} else {
-						free(iface->invalid_addr6);
-						iface->invalid_addr6 = NULL;
+					if (cur_pfx->pfx_len == cur_addr->prefix &&
+						!odhcpd_bmemcmp(&cur_pfx->pfx, &cur_addr->addr.in6, cur_pfx->pfx_len)) {
+						pfx_found = true;
+						break;
 					}
-				} else
-					++i;
+				}
+
+				if (!pfx_found) {
+					struct odhcpd_ipaddr *addr = &addrs[total_addr_cnt];
+
+					memcpy(&addr->addr.in6, &cur_pfx->pfx, sizeof(addr->addr.in6));
+					addr->prefix = cur_pfx->pfx_len;
+					addr->preferred_lt = 0;
+					addr->valid_lt = cur_pfx->pfx_lt;
+					total_addr_cnt++;
+				}
 			}
 		}
 	}
 
 	/* Construct Prefix Information options */
-	for (ssize_t i = 0; i < valid_addr_cnt + invalid_addr_cnt; ++i) {
+	for (size_t i = 0; i < total_addr_cnt; ++i) {
 		struct odhcpd_ipaddr *addr = &addrs[i];
 		struct nd_opt_prefix_info *p = NULL;
 		uint32_t preferred_lt = 0;
@@ -651,8 +758,27 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 			p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_AUTO;
 		if (iface->ra_advrouter)
 			p->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_RADDR;
-		p->nd_opt_pi_preferred_time = htonl(preferred_lt);
-		p->nd_opt_pi_valid_time = htonl(valid_lt);
+		if (i >= valid_addr_cnt || !preferred_lt)
+		{
+			/* 
+			 * RFC9096 § 3.5
+			 *
+			 * - Any prefixes that were previously advertised by the CE router
+			 *   via PIOs in RA messages, but that have now become stale, MUST
+			 *   be advertised with PIOs that have the "Valid Lifetime" and the
+			 *   "Preferred Lifetime" set to 0 and the "A" and "L" bits
+			 *   unchanged.
+			 */
+			p->nd_opt_pi_preferred_time = 0;
+			p->nd_opt_pi_valid_time = 0;
+		}
+		else
+		{
+			p->nd_opt_pi_preferred_time = htonl(preferred_lt);
+			p->nd_opt_pi_valid_time = htonl(valid_lt);
+
+			router_store_delegated_ipv6(now, iface, p, addr->valid_lt);
+		}
 	}
 
 	iov[IOV_RA_PFXS].iov_base = (char *)pfxs;
@@ -812,7 +938,7 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 	 *           WAN interface.
 	 */
 
-	for (ssize_t i = 0; i < valid_addr_cnt; ++i) {
+	for (size_t i = 0; i < valid_addr_cnt; ++i) {
 		struct odhcpd_ipaddr *addr = &addrs[i];
 		struct nd_opt_route_info *tmp;
 		uint32_t valid_lt;
@@ -888,8 +1014,13 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 
 	syslog(LOG_NOTICE, "Sending a RA on %s", iface->name);
 
-	if (odhcpd_send(iface->router_event.uloop.fd, &dest, iov, ARRAY_SIZE(iov), iface) > 0)
+	if (odhcpd_send(iface->router_event.uloop.fd, &dest, iov, ARRAY_SIZE(iov), iface) > 0) {
 		iface->ra_sent++;
+
+		/* RFC9096 store SLAAC advertisements */
+		if (iface->del_pfx_upd && !router_write_pdfile())
+			iface->del_pfx_upd = false;
+	}
 
 out:
 	free(pfxs);
@@ -1027,4 +1158,111 @@ static void forward_router_advertisement(const struct interface *iface, uint8_t 
 
 		odhcpd_send(c->router_event.uloop.fd, &all_nodes, &iov, 1, c);
 	}
+}
+
+int router_write_pdfile(void)
+{
+	char *base_pdfile, *pbase_pdfile, *dir_pdfile, *pdir_pdfile, *tmp_pdfile;
+	struct json_object *json, *interfaces_json;
+	unsigned pdfile_strlen, tmp_pdfile_strlen;
+	char ipv6_str[INET6_ADDRSTRLEN];
+	time_t time_now, time_ref;
+	struct interface *iface;
+	uint8_t new_md5[16];
+	md5_ctx_t md5;
+	int fd, ret;
+
+	if (!config.dhcp_pdfile)
+		return 0;
+
+	md5_begin(&md5);
+
+	pdfile_strlen = strlen(config.dhcp_pdfile) + 1;
+
+	dir_pdfile = strndup(config.dhcp_pdfile, pdfile_strlen);
+	base_pdfile = strndup(config.dhcp_pdfile, pdfile_strlen);
+
+	pdir_pdfile = dirname(dir_pdfile);
+	pbase_pdfile = basename(base_pdfile);
+
+	tmp_pdfile_strlen = pdfile_strlen + 1;
+	tmp_pdfile = alloca(tmp_pdfile_strlen);
+
+	snprintf(tmp_pdfile, tmp_pdfile_strlen, "%s/.%s", pdir_pdfile, pbase_pdfile);
+
+	free(dir_pdfile);
+	free(base_pdfile);
+
+	fd = open(tmp_pdfile, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return -1;
+
+	syslog(LOG_WARNING, "[RFC9096] temporary pdfile: %s", tmp_pdfile);
+
+	json = json_object_new_object();
+
+	time_now = odhcpd_time();
+	time_ref = time(NULL);
+
+	json_object_object_add(json, JSON_TIME, json_object_new_int64(time_ref));
+
+	interfaces_json = json_object_new_array();
+	json_object_object_add(json, JSON_INTERFACES, interfaces_json);
+
+	avl_for_each_element(&interfaces, iface, avl) {
+		struct json_object *interface_json, *slaac_json;
+		size_t i;
+
+		if (!(iface->ra == MODE_SERVER && !iface->master))
+			continue;
+
+		md5_hash(iface->ifname, strlen(iface->ifname), &md5);
+
+		interface_json = json_object_new_object();
+		json_object_object_add(interface_json, JSON_INTERFACE, json_object_new_string(iface->ifname));
+
+		slaac_json = json_object_new_array();
+		json_object_object_add(interface_json, JSON_SLAAC, slaac_json);
+
+		for (i = 0; i < iface->del_pfx_cnt; i++) {
+			struct json_object *cur_slaac_json = json_object_new_object();
+			const struct del_ipv6 *cur_pfx = &iface->del_pfx[i];
+			const uint32_t lifetime = TIME_LEFT(cur_pfx->pfx_lt, time_now);
+
+			md5_hash(cur_pfx, sizeof(*cur_pfx), &md5);
+
+			inet_ntop(AF_INET6, &cur_pfx->pfx, ipv6_str, INET6_ADDRSTRLEN);
+
+			json_object_object_add(cur_slaac_json, JSON_PREFIX, json_object_new_string(ipv6_str));
+			json_object_object_add(cur_slaac_json, JSON_LENGTH, json_object_new_uint64(cur_pfx->pfx_len));
+			json_object_object_add(cur_slaac_json, JSON_LIFETIME, json_object_new_uint64(lifetime));
+
+			json_object_array_add(slaac_json, cur_slaac_json);
+		}
+
+		json_object_array_add(interfaces_json, interface_json);
+	}
+
+	ret = json_object_to_fd(fd, json, JSON_C_TO_STRING_PLAIN);
+	json_object_put(json);
+	close(fd);
+	if (ret) {
+		syslog(LOG_ERR, "[RFC9096] JSON error: %s", json_util_get_last_err());
+		remove(tmp_pdfile);
+		return -1;
+	}
+
+	md5_end(new_md5, &md5);
+
+	if (memcmp(pd_md5, new_md5, sizeof(pd_md5))) {
+		syslog(LOG_WARNING, "[RFC9096] rename pdfile: %s -> %s", tmp_pdfile, config.dhcp_pdfile);
+		memcpy(pd_md5, new_md5, sizeof(pd_md5));
+		ret = rename(tmp_pdfile, config.dhcp_pdfile);
+		if (ret)
+			syslog(LOG_ERR, "[RFC9096] error %d renaming %s", ret, tmp_pdfile);
+	} else {
+		unlink(tmp_pdfile);
+	}
+
+	return 0;
 }

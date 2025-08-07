@@ -11,6 +11,7 @@
 
 #include <uci.h>
 #include <uci_blob.h>
+#include <json-c/json.h>
 #include <libubox/utils.h>
 #include <libubox/avl.h>
 #include <libubox/avl-cmp.h>
@@ -31,7 +32,7 @@ struct vlist_tree leases = VLIST_TREE_INIT(leases, lease_cmp, lease_update, true
 AVL_TREE(interfaces, avl_strcmp, false, NULL);
 struct config config = {.legacy = false, .main_dhcpv4 = false,
 			.dhcp_cb = NULL, .dhcp_statefile = NULL, .dhcp_hostsfile = NULL,
-			.log_level = LOG_WARNING};
+			.dhcp_pdfile = NULL, .log_level = LOG_WARNING};
 
 #define START_DEFAULT	100
 #define LIMIT_DEFAULT	150
@@ -200,6 +201,7 @@ enum {
 	ODHCPD_ATTR_LEASETRIGGER,
 	ODHCPD_ATTR_LOGLEVEL,
 	ODHCPD_ATTR_HOSTSFILE,
+	ODHCPD_ATTR_PDFILE,
 	ODHCPD_ATTR_MAX
 };
 
@@ -210,6 +212,7 @@ static const struct blobmsg_policy odhcpd_attrs[ODHCPD_ATTR_MAX] = {
 	[ODHCPD_ATTR_LEASETRIGGER] = { .name = "leasetrigger", .type = BLOBMSG_TYPE_STRING },
 	[ODHCPD_ATTR_LOGLEVEL] = { .name = "loglevel", .type = BLOBMSG_TYPE_INT32 },
 	[ODHCPD_ATTR_HOSTSFILE] = { .name = "hostsfile", .type = BLOBMSG_TYPE_STRING },
+	[ODHCPD_ATTR_PDFILE] = { .name = "pdfile", .type = BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list odhcpd_attr_list = {
@@ -317,8 +320,8 @@ static void close_interface(struct interface *iface)
 	clean_interface(iface);
 	free(iface->addr4);
 	free(iface->addr6);
-	free(iface->invalid_addr6);
 	free(iface->ifname);
+	free(iface->del_pfx);
 	free(iface);
 }
 
@@ -386,6 +389,11 @@ static void set_config(struct uci_section *s)
 	if ((c = tb[ODHCPD_ATTR_HOSTSFILE])) {
 		free(config.dhcp_hostsfile);
 		config.dhcp_hostsfile = strdup(blobmsg_get_string(c));
+	}
+
+	if ((c = tb[ODHCPD_ATTR_PDFILE])) {
+		free(config.dhcp_pdfile);
+		config.dhcp_pdfile = strdup(blobmsg_get_string(c));
 	}
 
 	if ((c = tb[ODHCPD_ATTR_LEASETRIGGER])) {
@@ -1663,6 +1671,92 @@ static int ipv6_pxe_from_uci(struct uci_section* s)
 	return ipv6_pxe_entry_new(arch, url) ? -1 : 0;
 }
 
+static void pdfile_load_json(void)
+{
+	json_object *json = json_object_from_file(config.dhcp_pdfile);
+
+	if (json) {
+		json_object *time_json = json_object_object_get(json, JSON_TIME);
+		time_t time_ref_json = (time_t) json_object_get_int64(time_json);
+		json_object *interfaces_json = json_object_object_get(json, JSON_INTERFACES);
+		time_t time_ref, now;
+		size_t i, j;
+
+		time_ref = time(NULL);
+		now = odhcpd_time();
+
+		syslog(LOG_WARNING, "time_ref_json: %lld", (int64_t) time_ref_json);
+		syslog(LOG_WARNING, "time_ref: %lld", (int64_t) time_ref);
+
+		if (time_ref > time_ref_json)
+			time_ref = time_ref - time_ref_json;
+		else
+			time_ref = now;
+
+		syslog(LOG_WARNING, "time: %lld", (int64_t) time_ref);
+
+		for (i = 0; i < json_object_array_length(interfaces_json); i++) {
+			json_object *interface_json = json_object_array_get_idx(interfaces_json, i);
+			json_object *iface_json = json_object_object_get(interface_json, JSON_INTERFACE);
+			const char *ifname = json_object_get_string(iface_json);
+			json_object *slaac_json = json_object_object_get(interface_json, JSON_SLAAC);
+			struct interface *cur_iface, *iface = NULL;
+
+			syslog(LOG_WARNING, "ifname: %s", ifname);
+
+			avl_for_each_element(&interfaces, cur_iface, avl) {
+				if (!strcmp(cur_iface->ifname, ifname)) {
+					iface = cur_iface;
+					break;
+				}
+			}
+
+			if (iface == NULL)
+				continue;
+
+			for (j = 0; j < json_object_array_length(slaac_json); j++) {
+				json_object *cur_slaac_json = json_object_array_get_idx(slaac_json, j);
+				json_object *prefix_json = json_object_object_get(cur_slaac_json, JSON_PREFIX);
+				json_object *length_json = json_object_object_get(cur_slaac_json, JSON_LENGTH);
+				json_object *lifetime_json = json_object_object_get(cur_slaac_json, JSON_LIFETIME);
+				const char *pfx_str = json_object_get_string(prefix_json);
+				uint8_t pfx_len = (uint8_t) json_object_get_uint64(length_json);
+				uint32_t lifetime = (uint32_t) json_object_get_uint64(lifetime_json);
+				uint32_t valid_lt;
+				time_t pfx_lt;
+
+				if (lifetime > time_ref)
+					valid_lt = lifetime - time_ref;
+				else
+					valid_lt = 0;
+
+				pfx_lt = now + valid_lt;
+
+				syslog(LOG_WARNING, "%s: %s/%u [%u -> %u]",
+					ifname,
+					pfx_str,
+					pfx_len,
+					lifetime,
+					valid_lt);
+
+				if (valid_lt) {
+					iface->del_pfx_cnt++;
+					iface->del_pfx = realloc(iface->del_pfx, sizeof(struct del_ipv6) * iface->del_pfx_cnt);
+					if (iface->del_pfx) {
+						struct del_ipv6 *del_pfx = &iface->del_pfx[iface->del_pfx_cnt - 1];
+						inet_pton(AF_INET6, pfx_str, &del_pfx->pfx);
+						del_pfx->pfx_len = pfx_len;
+						del_pfx->pfx_lt = (uint32_t) pfx_lt;
+						syslog(LOG_WARNING, "RFC9096: %s: load %s/%u [%u]", ifname, pfx_str, pfx_len, valid_lt);
+					}
+				}
+			}
+		}
+
+		json_object_put(json);
+	}
+}
+
 void odhcpd_reload(void)
 {
 	struct uci_context *uci = uci_alloc_context();
@@ -1716,6 +1810,9 @@ void odhcpd_reload(void)
 		mkdir_p(dirname(path), 0755);
 		free(path);
 	}
+
+	if (config.dhcp_pdfile)
+		pdfile_load_json();
 
 	vlist_flush(&leases);
 
