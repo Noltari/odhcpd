@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <fcntl.h>
 #include <resolv.h>
 #include <signal.h>
@@ -11,6 +12,7 @@
 
 #include <uci.h>
 #include <uci_blob.h>
+#include <json-c/json.h>
 #include <libubox/utils.h>
 #include <libubox/avl.h>
 #include <libubox/avl-cmp.h>
@@ -31,7 +33,7 @@ struct vlist_tree leases = VLIST_TREE_INIT(leases, lease_cmp, lease_update, true
 AVL_TREE(interfaces, avl_strcmp, false, NULL);
 struct config config = {.legacy = false, .main_dhcpv4 = false,
 			.dhcp_cb = NULL, .dhcp_statefile = NULL, .dhcp_hostsfile = NULL,
-			.log_level = LOG_WARNING};
+			.ra_piofolder = NULL, .log_level = LOG_WARNING};
 
 #define START_DEFAULT	100
 #define LIMIT_DEFAULT	150
@@ -200,6 +202,7 @@ enum {
 	ODHCPD_ATTR_LEASETRIGGER,
 	ODHCPD_ATTR_LOGLEVEL,
 	ODHCPD_ATTR_HOSTSFILE,
+	ODHCPD_ATTR_PIOFOLDER,
 	ODHCPD_ATTR_MAX
 };
 
@@ -210,6 +213,7 @@ static const struct blobmsg_policy odhcpd_attrs[ODHCPD_ATTR_MAX] = {
 	[ODHCPD_ATTR_LEASETRIGGER] = { .name = "leasetrigger", .type = BLOBMSG_TYPE_STRING },
 	[ODHCPD_ATTR_LOGLEVEL] = { .name = "loglevel", .type = BLOBMSG_TYPE_INT32 },
 	[ODHCPD_ATTR_HOSTSFILE] = { .name = "hostsfile", .type = BLOBMSG_TYPE_STRING },
+	[ODHCPD_ATTR_PIOFOLDER] = { .name = "piofolder", .type = BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list odhcpd_attr_list = {
@@ -276,6 +280,7 @@ static void set_interface_defaults(struct interface *iface)
 	iface->ra_mininterval = iface->ra_maxinterval/3;
 	iface->ra_lifetime = -1;
 	iface->ra_dns = true;
+	iface->pio_update = false;
 }
 
 static void clean_interface(struct interface *iface)
@@ -318,7 +323,7 @@ static void close_interface(struct interface *iface)
 	clean_interface(iface);
 	free(iface->addr4);
 	free(iface->addr6);
-	free(iface->invalid_addr6);
+	free(iface->pios);
 	free(iface->ifname);
 	free(iface);
 }
@@ -387,6 +392,11 @@ static void set_config(struct uci_section *s)
 	if ((c = tb[ODHCPD_ATTR_HOSTSFILE])) {
 		free(config.dhcp_hostsfile);
 		config.dhcp_hostsfile = strdup(blobmsg_get_string(c));
+	}
+
+	if ((c = tb[ODHCPD_ATTR_PIOFOLDER])) {
+		free(config.ra_piofolder);
+		config.ra_piofolder = strdup(blobmsg_get_string(c));
 	}
 
 	if ((c = tb[ODHCPD_ATTR_LEASETRIGGER])) {
@@ -1480,6 +1490,8 @@ int config_parse_interface(void *data, size_t len, const char *name, bool overwr
 		}
 	}
 
+	config_load_ra_pio(iface);
+
 	return 0;
 
 err:
@@ -1701,6 +1713,340 @@ static int ipv6_pxe_from_uci(struct uci_section* s)
 		arch = blobmsg_get_u32(tb[IPV6_PXE_ARCH]);
 
 	return ipv6_pxe_entry_new(arch, url) ? -1 : 0;
+}
+
+#define JSON_LENGTH "length"
+#define JSON_PREFIX "prefix"
+#define JSON_SLAAC "slaac"
+#define JSON_TIME "time"
+
+static inline time_t config_time_from_json(time_t json_time)
+{
+	time_t ref, now;
+
+	ref = time(NULL);
+	now = odhcpd_time();
+
+	if (now > json_time || ref > json_time)
+		return 0;
+
+	return json_time + (now - ref);
+}
+
+static inline time_t config_time_to_json(time_t config_time)
+{
+	time_t ref, now;
+
+	ref = time(NULL);
+	now = odhcpd_time();
+
+	return config_time + (ref - now);
+}
+
+static inline bool config_ra_pio_enabled(struct interface *iface)
+{
+	return config.ra_piofolder && iface->ra == MODE_SERVER && !iface->master;
+}
+
+static bool config_ra_pio_time(json_object *slaac_json, time_t *slaac_time)
+{
+	time_t pio_json_time, pio_time;
+	json_object *time_json;
+
+	time_json = json_object_object_get(slaac_json, JSON_TIME);
+	if (!time_json)
+		return true;
+
+	pio_json_time = (time_t) json_object_get_int64(time_json);
+	if (!pio_json_time)
+		return true;
+
+	pio_time = config_time_from_json(pio_json_time);
+	if (!pio_time)
+		return false;
+
+	*slaac_time = pio_time;
+
+	return true;
+}
+
+static json_object *config_load_ra_pio_json(struct interface *iface)
+{
+	unsigned ifname_strlen, piofile_strlen, piofolder_strlen;
+	json_object *json;
+	char *piofile;
+	int fd;
+
+	fd = open(config.ra_piofolder, O_DIRECTORY);
+	if (fd < 0)
+		return NULL;
+
+	close(fd);
+
+	ifname_strlen = strlen(iface->ifname);
+	piofolder_strlen = strlen(config.ra_piofolder);
+	piofile_strlen = ifname_strlen + piofolder_strlen + 2;
+
+	piofile = alloca(piofile_strlen);
+	snprintf(piofile, piofile_strlen, "%s/%s", config.ra_piofolder, iface->ifname);
+
+	fd = open(piofile, O_RDONLY);
+	if (fd < 0)
+		return NULL;
+
+	json = json_object_from_fd(fd);
+
+	close(fd);
+
+	if (!json)
+		syslog(LOG_ERR,
+			"rfc9096: %s: json read error %s",
+			iface->name,
+			json_util_get_last_err());
+
+	return json;
+}
+
+void config_load_ra_pio(struct interface *iface)
+{
+	json_object *json, *slaac_json;
+	size_t pio_cnt;
+	time_t now;
+
+	if (!config_ra_pio_enabled(iface))
+		return;
+
+	json = config_load_ra_pio_json(iface);
+	if (!json)
+		return;
+
+	slaac_json = json_object_object_get(json, JSON_SLAAC);
+	if (!slaac_json) {
+		json_object_put(json);
+		return;
+	}
+
+	now = odhcpd_time();
+
+	pio_cnt = json_object_array_length(slaac_json);
+	iface->pios = malloc(sizeof(struct ra_pio) * pio_cnt);
+	if (!iface->pios) {
+		json_object_put(json);
+		return;
+	}
+
+	iface->pio_cnt = 0;
+	for (size_t i = 0; i < pio_cnt; i++) {
+		json_object *cur_pio_json, *length_json, *prefix_json;
+		const char *pio_str;
+		time_t pio_lt = 0;
+		struct ra_pio *pio;
+		uint8_t pio_len;
+
+		cur_pio_json = json_object_array_get_idx(slaac_json, i);
+		if (!cur_pio_json)
+			continue;
+
+		if (!config_ra_pio_time(cur_pio_json, &pio_lt))
+			continue;
+
+		length_json = json_object_object_get(cur_pio_json, JSON_LENGTH);
+		if (!length_json)
+			continue;
+
+		prefix_json = json_object_object_get(cur_pio_json, JSON_PREFIX);
+		if (!prefix_json)
+			continue;
+
+		pio_len = (uint8_t) json_object_get_uint64(length_json);
+		pio_str = json_object_get_string(prefix_json);
+		pio = &iface->pios[iface->pio_cnt];
+
+		inet_pton(AF_INET6, pio_str, &pio->prefix);
+		pio->length = pio_len;
+		pio->lifetime = pio_lt;
+		syslog(LOG_INFO,
+			"rfc9096: %s: load %s/%u (%u)",
+			iface->ifname,
+			pio_str,
+			pio_len,
+			ra_pio_lifetime(pio, now));
+
+		iface->pio_cnt++;
+	}
+
+	json_object_put(json);
+
+	if (!iface->pio_cnt) {
+		free(iface->pios);
+		iface->pios = NULL;
+	} else if (iface->pio_cnt != pio_cnt) {
+		iface->pios = realloc(iface->pios, sizeof(struct ra_pio) * iface->pio_cnt);
+	}
+}
+
+static void config_save_ra_pio_json(struct interface *iface, struct json_object *json)
+{
+	unsigned ifname_strlen, piofile_strlen, piofolder_strlen, tmp_piofile_strlen;
+	char *piofile, *tmp_piofile;
+	int fd, ret;
+
+	fd = open(config.ra_piofolder, O_DIRECTORY);
+	if (fd < 0) {
+		ret = mkdir_p(config.ra_piofolder, 0755);
+		if (ret) {
+			syslog(LOG_ERR,
+				"rfc9096: %s: error %m creating %s",
+				iface->name,
+				config.ra_piofolder);
+			return;
+		}
+	} else {
+		close(fd);
+	}
+
+	ifname_strlen = strlen(iface->ifname);
+	piofolder_strlen = strlen(config.ra_piofolder);
+	piofile_strlen = ifname_strlen + piofolder_strlen + 2;
+	tmp_piofile_strlen = piofile_strlen + 1;
+
+	piofile = alloca(piofile_strlen);
+	tmp_piofile = alloca(tmp_piofile_strlen);
+
+	snprintf(piofile, piofile_strlen, "%s/%s", config.ra_piofolder, iface->ifname);
+	snprintf(tmp_piofile, tmp_piofile_strlen, "%s/.%s", config.ra_piofolder, iface->ifname);
+
+	fd = open(tmp_piofile, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		syslog(LOG_ERR,
+			"rfc9096: %s: error %m creating %s",
+			iface->ifname,
+			tmp_piofile);
+		return;
+	}
+
+	ret = json_object_to_fd(fd, json, JSON_C_TO_STRING_PLAIN);
+	if (ret) {
+		syslog(LOG_ERR,
+			"rfc9096: %s: json write error %s",
+			iface->name,
+			json_util_get_last_err());
+		close(fd);
+		unlink(tmp_piofile);
+		return;
+	}
+
+	ret = fsync(fd);
+	if (ret) {
+		syslog(LOG_ERR,
+			"rfc9096: %s: error %m syncing %s",
+			iface->name,
+			tmp_piofile);
+		close(fd);
+		unlink(tmp_piofile);
+		return;
+	}
+
+	ret = close(fd);
+	if (ret) {
+		syslog(LOG_ERR,
+			"rfc9096: %s: error %m closing %s",
+			iface->name,
+			tmp_piofile);
+		unlink(tmp_piofile);
+		return;
+	}
+
+	ret = rename(tmp_piofile, piofile);
+	if (ret) {
+		syslog(LOG_ERR,
+			"rfc9096: %s: error %m renaming piofile: %s -> %s",
+			iface->name,
+			tmp_piofile,
+			piofile);
+		unlink(tmp_piofile);
+		return;
+	}
+
+	iface->pio_update = false;
+	syslog(LOG_WARNING,
+		"rfc9096: %s: update piofile %s",
+		iface->name,
+		piofile);
+}
+
+void config_save_ra_pio(struct interface *iface)
+{
+	struct json_object *json, *slaac_json;
+	char ipv6_str[INET6_ADDRSTRLEN];
+	time_t now;
+
+	if (!config_ra_pio_enabled(iface))
+		return;
+
+	if (!iface->pio_update)
+		return;
+
+	now = odhcpd_time();
+
+	json = json_object_new_object();
+	if (!json)
+		return;
+
+	slaac_json = json_object_new_array_ext(iface->pio_cnt);
+	if (!slaac_json) {
+		json_object_put(slaac_json);
+		return;
+	}
+
+	json_object_object_add(json, JSON_SLAAC, slaac_json);
+
+	for (size_t i = 0; i < iface->pio_cnt; i++) {
+		struct json_object *cur_pio_json, *len_json, *pfx_json;
+		const struct ra_pio *cur_pio = &iface->pios[i];
+
+		if (ra_pio_expired(cur_pio, now))
+			continue;
+
+		cur_pio_json = json_object_new_object();
+		if (!cur_pio_json)
+			continue;
+
+		inet_ntop(AF_INET6, &cur_pio->prefix, ipv6_str, sizeof(ipv6_str));
+
+		pfx_json = json_object_new_string(ipv6_str);
+		if (!pfx_json) {
+			json_object_put(cur_pio_json);
+			continue;
+		}
+
+		len_json = json_object_new_uint64(cur_pio->length);
+		if (!len_json) {
+			json_object_put(cur_pio_json);
+			json_object_put(pfx_json);
+			continue;
+		}
+
+		json_object_object_add(cur_pio_json, JSON_PREFIX, pfx_json);
+		json_object_object_add(cur_pio_json, JSON_LENGTH, len_json);
+
+		if (cur_pio->lifetime) {
+			struct json_object *time_json;
+			time_t pio_lt;
+
+			pio_lt = config_time_to_json(cur_pio->lifetime);
+
+			time_json = json_object_new_int64(pio_lt);
+			if (time_json)
+				json_object_object_add(cur_pio_json, JSON_TIME, time_json);
+		}
+
+		json_object_array_add(slaac_json, cur_pio_json);
+	}
+
+	config_save_ra_pio_json(iface, json);
+
+	json_object_put(json);
 }
 
 void odhcpd_reload(void)
