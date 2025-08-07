@@ -136,7 +136,6 @@ struct odhcpd_ipaddr {
 		/* ipv6 only */
 		struct {
 			uint8_t dprefix;
-			uint8_t invalid_advertisements;
 			bool tentative;
 		};
 
@@ -169,6 +168,7 @@ struct config {
 	char *dhcp_cb;
 	char *dhcp_statefile;
 	char *dhcp_hostsfile;
+	char *dhcp_pdfile;
 	int log_level;
 };
 
@@ -265,6 +265,14 @@ struct dnr_options {
 };
 
 
+// Stale IPv6 - RFC9096
+struct del_ipv6 {
+	struct in6_addr pfx;
+	uint8_t pfx_len;
+	uint32_t pfx_lt;
+};
+
+
 struct interface {
 	struct avl_node avl;
 
@@ -276,8 +284,6 @@ struct interface {
 	// IPv6 runtime data
 	struct odhcpd_ipaddr *addr6;
 	size_t addr6_len;
-	struct odhcpd_ipaddr *invalid_addr6;
-	size_t invalid_addr6_len;
 
 	// RA runtime data
 	struct odhcpd_event router_event;
@@ -398,6 +404,11 @@ struct interface {
 	// DNR
 	struct dnr_options *dnr;
 	size_t dnr_cnt;
+
+	// RFC9096 SLAAC
+	struct del_ipv6 *del_pfx;
+	size_t del_pfx_cnt;
+	bool del_pfx_upd;
 };
 
 extern struct avl_tree interfaces;
@@ -464,6 +475,7 @@ struct lease *config_find_lease_by_duid(const uint8_t *duid, const uint16_t len)
 struct lease *config_find_lease_by_mac(const uint8_t *mac);
 struct lease *config_find_lease_by_hostid(const uint64_t hostid);
 struct lease *config_find_lease_by_ipaddr(const uint32_t ipaddr);
+int config_save_pdfile(void);
 int set_lease_from_blobmsg(struct blob_attr *ba);
 
 #ifdef WITH_UBUS
