@@ -31,9 +31,16 @@ static void lease_update(struct vlist_tree *tree, struct vlist_node *node_new,
 
 struct vlist_tree leases = VLIST_TREE_INIT(leases, lease_cmp, lease_update, true, false);
 AVL_TREE(interfaces, avl_strcmp, false, NULL);
-struct config config = {.legacy = false, .main_dhcpv4 = false,
-			.dhcp_cb = NULL, .dhcp_statefile = NULL, .dhcp_hostsfile = NULL,
-			.ra_piofolder = NULL, .log_level = LOG_WARNING};
+struct config config = {
+	.legacy = false,
+	.main_dhcpv4 = false,
+	.dhcp_cb = NULL,
+	.dhcp_statefile = NULL,
+	.dhcp_hostsfile = NULL,
+	.ra_piofolder = NULL,
+	.ra_piofolder_dirfd = -1,
+	.log_level = LOG_WARNING,
+};
 
 #define START_DEFAULT	100
 #define LIMIT_DEFAULT	150
@@ -1772,25 +1779,10 @@ static bool config_ra_pio_time(json_object *slaac_json, time_t *slaac_time)
 
 static json_object *config_load_ra_pio_json(struct interface *iface)
 {
-	unsigned ifname_strlen, piofile_strlen, piofolder_strlen;
 	json_object *json;
-	char *piofile;
 	int fd;
 
-	fd = open(config.ra_piofolder, O_DIRECTORY);
-	if (fd < 0)
-		return NULL;
-
-	close(fd);
-
-	ifname_strlen = strlen(iface->ifname);
-	piofolder_strlen = strlen(config.ra_piofolder);
-	piofile_strlen = ifname_strlen + piofolder_strlen + 2;
-
-	piofile = alloca(piofile_strlen);
-	snprintf(piofile, piofile_strlen, "%s/%s", config.ra_piofolder, iface->ifname);
-
-	fd = open(piofile, O_RDONLY);
+	fd = openat(config.ra_piofolder_dirfd, iface->ifname, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return NULL;
 
@@ -1885,94 +1877,49 @@ void config_load_ra_pio(struct interface *iface)
 	}
 }
 
+#define JSON_TMP_FILE ".tmp.json"
+
 static void config_save_ra_pio_json(struct interface *iface, struct json_object *json)
 {
-	unsigned ifname_strlen, piofile_strlen, piofolder_strlen, tmp_piofile_strlen;
-	char *piofile, *tmp_piofile;
-	int fd, ret;
+	int fd;
 
-	fd = open(config.ra_piofolder, O_DIRECTORY);
+	fd = openat(config.ra_piofolder_dirfd, JSON_TMP_FILE,
+		    O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
 	if (fd < 0) {
-		ret = mkdir_p(config.ra_piofolder, 0755);
-		if (ret) {
-			syslog(LOG_ERR,
-				"rfc9096: %s: error %m creating %s",
-				iface->name,
-				config.ra_piofolder);
-			return;
-		}
-	} else {
-		close(fd);
-	}
-
-	ifname_strlen = strlen(iface->ifname);
-	piofolder_strlen = strlen(config.ra_piofolder);
-	piofile_strlen = ifname_strlen + piofolder_strlen + 2;
-	tmp_piofile_strlen = piofile_strlen + 1;
-
-	piofile = alloca(piofile_strlen);
-	tmp_piofile = alloca(tmp_piofile_strlen);
-
-	snprintf(piofile, piofile_strlen, "%s/%s", config.ra_piofolder, iface->ifname);
-	snprintf(tmp_piofile, tmp_piofile_strlen, "%s/.%s", config.ra_piofolder, iface->ifname);
-
-	fd = open(tmp_piofile, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
-	if (fd < 0) {
-		syslog(LOG_ERR,
-			"rfc9096: %s: error %m creating %s",
-			iface->ifname,
-			tmp_piofile);
+		syslog(LOG_ERR, "rfc9096: %s: error %m creating temporary json file",
+		       iface->ifname);
 		return;
 	}
 
-	ret = json_object_to_fd(fd, json, JSON_C_TO_STRING_PLAIN);
-	if (ret) {
-		syslog(LOG_ERR,
-			"rfc9096: %s: json write error %s",
-			iface->name,
-			json_util_get_last_err());
-		close(fd);
-		unlink(tmp_piofile);
-		return;
+	if (json_object_to_fd(fd, json, JSON_C_TO_STRING_PLAIN) < 0) {
+		syslog(LOG_ERR, "rfc9096: %s: json write error %s",
+		       iface->name, json_util_get_last_err());
+		goto err;
 	}
 
-	ret = fsync(fd);
-	if (ret) {
-		syslog(LOG_ERR,
-			"rfc9096: %s: error %m syncing %s",
-			iface->name,
-			tmp_piofile);
-		close(fd);
-		unlink(tmp_piofile);
-		return;
+	if (fsync(fd) < 0) {
+		syslog(LOG_ERR, "rfc9096: %s: error %m syncing %s",
+		       iface->name, JSON_TMP_FILE);
+		goto err;
 	}
 
-	ret = close(fd);
-	if (ret) {
-		syslog(LOG_ERR,
-			"rfc9096: %s: error %m closing %s",
-			iface->name,
-			tmp_piofile);
-		unlink(tmp_piofile);
-		return;
-	}
+	close(fd);
+	fd = -1;
 
-	ret = rename(tmp_piofile, piofile);
-	if (ret) {
-		syslog(LOG_ERR,
-			"rfc9096: %s: error %m renaming piofile: %s -> %s",
-			iface->name,
-			tmp_piofile,
-			piofile);
-		unlink(tmp_piofile);
-		return;
+	if (renameat(config.ra_piofolder_dirfd, JSON_TMP_FILE,
+		     config.ra_piofolder_dirfd, iface->ifname) < 0) {
+		syslog(LOG_ERR, "rfc9096: %s: error %m renaming piofile: %s -> %s",
+		       iface->name, JSON_TMP_FILE, iface->name);
+		goto err;
 	}
 
 	iface->pio_update = false;
-	syslog(LOG_WARNING,
-		"rfc9096: %s: update piofile %s",
-		iface->name,
-		piofile);
+	syslog(LOG_WARNING, "rfc9096: %s: piofile updated", iface->name);
+	return;
+
+err:
+	close(fd);
+	unlinkat(config.ra_piofolder_dirfd, JSON_TMP_FILE, 0);
 }
 
 void config_save_ra_pio(struct interface *iface)
@@ -2101,6 +2048,16 @@ void odhcpd_reload(void)
 
 		mkdir_p(dirname(path), 0755);
 		free(path);
+	}
+
+	if (config.ra_piofolder) {
+		char *path = dirname(strdupa(config.ra_piofolder));
+
+		mkdir_p(path, 0755);
+		close(config.ra_piofolder_dirfd);
+		config.ra_piofolder_dirfd = open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+		if (config.ra_piofolder_dirfd < 0)
+			syslog(LOG_ERR, "Unable to open piofolder '%s': %m", path);
 	}
 
 	vlist_flush(&leases);

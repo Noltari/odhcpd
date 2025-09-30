@@ -172,7 +172,10 @@ struct config {
 	char *dhcp_cb;
 	char *dhcp_statefile;
 	char *dhcp_hostsfile;
+
 	char *ra_piofolder;
+	int ra_piofolder_dirfd;
+
 	int log_level;
 };
 
