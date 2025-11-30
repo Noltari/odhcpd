@@ -563,7 +563,7 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 	time_t now = odhcpd_time();
 	struct odhcpd_ipaddr *addrs = NULL;
 	struct adv_msg adv;
-	struct nd_opt_prefix_info *pfxs = NULL;
+	struct nd_opt_prefix_info *pfxs = NULL, *pfxs_tmp = NULL;
 	struct nd_opt_dns_server *dns = NULL;
 	struct nd_opt_search_list *search = NULL;
 	struct nd_opt_route_info *routes = NULL;
@@ -707,15 +707,13 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 		}
 
 		if (!p) {
-			struct nd_opt_prefix_info *tmp;
-
-			tmp = realloc(pfxs, sizeof(*pfxs) * (pfxs_cnt + 1));
-			if (!tmp) {
+			pfxs_tmp = realloc(pfxs, sizeof(*pfxs) * (pfxs_cnt + 1));
+			if (!pfxs_tmp) {
 				error("Realloc failed for RA prefix option on %s", iface->name);
 				continue;
 			}
 
-			pfxs = tmp;
+			pfxs = pfxs_tmp;
 			p = &pfxs[pfxs_cnt++];
 			memset(p, 0, sizeof(*p));
 		}
@@ -800,6 +798,34 @@ static int send_router_advert(struct interface *iface, const struct in6_addr *fr
 
 			router_add_ra_pio(iface, addr);
 		}
+	}
+
+	pfxs_tmp = malloc(sizeof(struct nd_opt_prefix_info) * pfxs_cnt);
+	if (pfxs_tmp) {
+		size_t idx = 0;
+
+		/* Stale PIOs */
+		for (size_t i = 0; i < pfxs_cnt; i++) {
+			const struct nd_opt_prefix_info *pfx = &pfxs[i];
+
+			if (!pfx->nd_opt_pi_preferred_time) {
+				memcpy(&pfxs_tmp[idx], pfx, sizeof(struct nd_opt_prefix_info));
+				idx++;
+			}
+		}
+
+		/* Valid PIOs */
+		for (size_t i = 0; i < pfxs_cnt; i++) {
+			const struct nd_opt_prefix_info *pfx = &pfxs[i];
+
+			if (pfx->nd_opt_pi_preferred_time) {
+				memcpy(&pfxs_tmp[idx], pfx, sizeof(struct nd_opt_prefix_info));
+				idx++;
+			}
+		}
+
+		free(pfxs);
+		pfxs = pfxs_tmp;
 	}
 
 	iov[IOV_RA_PFXS].iov_base = (char *)pfxs;
